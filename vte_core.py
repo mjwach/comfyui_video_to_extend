@@ -273,3 +273,148 @@ def blend_frames(old, new, color_space, envelope):
     a = to_space(old.float())
     b = to_space(new.float())
     return from_space(a + (b - a) * e).clamp(0.0, 1.0).to(new.dtype)
+
+
+# --- audio --------------------------------------------------------------------
+#
+# Audio values use ComfyUI's AUDIO format:
+#     {"waveform": tensor (batch, channels, samples), "sample_rate": int}
+# Internally a "track" is (waveform (channels, samples) float32, sample_rate),
+# or None when a source is missing or empty.
+
+DEFAULT_SAMPLE_RATE = 44100
+DEFAULT_CHANNELS = 2
+NULL_VTE_FPS = 24.0  # only used to size silence when no video gives a rate
+
+
+def audio_from_input(audio):
+    """Turn an AUDIO input into a track, or None if missing or empty."""
+    if not isinstance(audio, dict):
+        return None
+    wave, sr = audio.get("waveform"), audio.get("sample_rate")
+    if wave is None or not sr:
+        return None
+    wave = torch.as_tensor(wave).detach().cpu().float()
+    if wave.dim() == 3:
+        wave = wave[0]
+    elif wave.dim() == 1:
+        wave = wave[None]
+    if wave.dim() != 2 or wave.shape[0] == 0 or wave.shape[1] == 0:
+        return None
+    return wave, int(sr)
+
+
+def _stream_start(stream):
+    if stream is None or stream.start_time is None or stream.time_base is None:
+        return 0.0
+    return float(stream.start_time * stream.time_base)
+
+
+def decode_audio(path, seconds):
+    """First `seconds` of the file's audio, aligned to its first video frame.
+
+    Returns a track, or None if the file has no audio or none in that span.
+    Decoding problems are treated as missing audio rather than errors.
+    """
+    if seconds <= 0:
+        return None
+    try:
+        import av
+        with av.open(path) as container:
+            if not container.streams.audio:
+                return None
+            stream = container.streams.audio[0]
+            video = container.streams.video[0] if container.streams.video else None
+            sr = int(stream.codec_context.sample_rate or stream.rate or 0)
+            if sr <= 0:
+                return None
+            offset = round((_stream_start(stream) - _stream_start(video)) * sr)
+            wanted = round(seconds * sr)
+            need = wanted - offset  # samples to read from the stream itself
+            resampler = av.AudioResampler(format="fltp", rate=sr)
+            chunks, got = [], 0
+            if need > 0:
+                for frame in container.decode(stream):
+                    for f in resampler.resample(frame):
+                        arr = f.to_ndarray()
+                        chunks.append(arr)
+                        got += arr.shape[1]
+                    if got >= need:
+                        break
+    except Exception as e:
+        print(f"[comfyui_video_to_extend] could not read audio of {path!r}: {e}")
+        return None
+    if not chunks:
+        return None
+    wave = torch.from_numpy(np.concatenate(chunks, axis=1)).float()
+    if offset > 0:
+        wave = torch.cat([torch.zeros(wave.shape[0], offset), wave], dim=1)
+    elif offset < 0:
+        wave = wave[:, -offset:]
+    wave = wave[:, :wanted]
+    return (wave, sr) if wave.shape[1] > 0 else None
+
+
+def _resample(wave, sr, target):
+    if sr == target:
+        return wave
+    try:
+        import torchaudio.functional as AF
+        return AF.resample(wave, sr, target)
+    except Exception:
+        n = max(1, round(wave.shape[1] * target / sr))
+        return torch.nn.functional.interpolate(
+            wave[None], size=n, mode="linear", align_corners=False)[0]
+
+
+def _conform(track, sr, channels):
+    if track is None:
+        return None
+    wave = _resample(track[0], track[1], sr)
+    c = wave.shape[0]
+    if c < channels:
+        wave = wave.repeat((channels + c - 1) // c, 1)
+    return wave[:channels]
+
+
+def silent_audio(seconds, sr=DEFAULT_SAMPLE_RATE, channels=DEFAULT_CHANNELS):
+    n = max(1, round(seconds * sr))
+    return {"waveform": torch.zeros(1, channels, n), "sample_rate": sr}
+
+
+def splice_audio(orig, new, prefix_frames, new_frames, fade_frames, fps,
+                 envelope):
+    """Audio matching a video splice: the original track under the prefix,
+    then the new track under the new frames, crossfading from the original's
+    old working audio into the new track over the first `fade_frames` new
+    frames. Missing or short sections become silence; the new track is trimmed
+    or padded to exactly the new frames' duration.
+    """
+    sr = new[1] if new else (orig[1] if orig else DEFAULT_SAMPLE_RATE)
+    channels = max([t[0].shape[0] for t in (orig, new) if t]
+                   or [DEFAULT_CHANNELS])
+    o, n = _conform(orig, sr, channels), _conform(new, sr, channels)
+
+    s_pre = round(prefix_frames * sr / fps)
+    s_total = max(1, round((prefix_frames + new_frames) * sr / fps))
+    s_new = max(0, s_total - s_pre)
+    s_fade = min(s_new, round((prefix_frames + fade_frames) * sr / fps) - s_pre)
+
+    out = torch.zeros(channels, s_total)
+    if o is not None:
+        k = min(o.shape[1], s_pre)
+        out[:, :k] = o[:, :k]
+    if n is not None:
+        k = min(n.shape[1], s_new)
+        out[:, s_pre:s_pre + k] = n[:, :k]
+    if s_fade > 0:
+        old = torch.zeros(channels, s_fade)
+        if o is not None:
+            seg = o[:, s_pre:s_pre + s_fade]
+            old[:, :seg.shape[1]] = seg
+        # Smooth ramp across the whole region, so there's no click at its ends.
+        t = (torch.arange(s_fade, dtype=torch.float32) + 0.5) / s_fade
+        e = FADE_ENVELOPES[envelope](t)
+        region = out[:, s_pre:s_pre + s_fade]
+        out[:, s_pre:s_pre + s_fade] = old * (1 - e) + region * e
+    return {"waveform": out[None], "sample_rate": sr}

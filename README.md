@@ -45,7 +45,22 @@ All nodes are under the **video_to_extend** category.
     - `srgb` – plain mix of the stored pixel values; mid-fade frames tend to
       dip slightly darker and duller.
 
-  With a null VTE the input images pass through unchanged.
+  Audio: an optional `audio` input is the soundtrack of the input images,
+  starting at their first frame. The `audio` output is spliced to match the
+  video: the video file's own audio under the prefix, then the input audio
+  under the new frames, crossfading from the file's old working-section audio
+  over the same `fade_frames` with the same `fade_envelope`. The input audio
+  is trimmed or padded to exactly the new frames' duration. Any missing piece
+  (no input audio, no audio track in the file, a track that ends early) is
+  treated as silence, and if the two sources differ in sample rate or channel
+  count, the input audio's sample rate and the larger channel count win.
+
+  Outputs: `images`, `audio` (always a track, silent if need be), and
+  `has_audio`, which is false when neither source contributed any audio, so a
+  downstream node can choose to leave the audio track out entirely.
+
+  With a null VTE the input images and audio pass through unchanged (silence,
+  sized at 24 fps, if there's no input audio).
 - **Video To Extend → DICT** / **DICT → Video To Extend** – explicit
   conversions. Missing dict fields get defaults.
 

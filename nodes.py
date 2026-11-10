@@ -116,37 +116,54 @@ class VTERead:
 
 class VTESplice:
     """Outputs the VTE's prefix followed by new frames, with an optional
-    crossfade from the old working frames into the new ones."""
+    crossfade from the old working frames into the new ones, plus a matching
+    spliced audio track."""
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "vte": (VTE_INPUT_TYPE,),
-            "images": ("IMAGE",),
-            "fade_frames": ("INT", {
-                "default": 0, "min": 0, "max": BIG,
-                "tooltip": "0 = no fade. Clamped silently to the frames "
-                           "available on both sides."}),
-            "fade_envelope": (list(core.FADE_ENVELOPES.keys()),),
-            "fade_color_space": (list(core.FADE_COLOR_SPACES), {
-                "tooltip": "Colour space the crossfade is mixed in. oklab "
-                           "usually looks smoothest."}),
-        }}
+        return {
+            "required": {
+                "vte": (VTE_INPUT_TYPE,),
+                "images": ("IMAGE",),
+                "fade_frames": ("INT", {
+                    "default": 0, "min": 0, "max": BIG,
+                    "tooltip": "0 = no fade. Clamped silently to the frames "
+                               "available on both sides. Also used for the "
+                               "audio crossfade."}),
+                "fade_envelope": (list(core.FADE_ENVELOPES.keys()),),
+                "fade_color_space": (list(core.FADE_COLOR_SPACES), {
+                    "tooltip": "Colour space the crossfade is mixed in. oklab "
+                               "usually looks smoothest."}),
+            },
+            "optional": {
+                "audio": ("AUDIO", {
+                    "tooltip": "Audio track for the input images, starting at "
+                               "their first frame."}),
+            },
+        }
 
-    RETURN_TYPES = ("IMAGE", "INT")
-    RETURN_NAMES = ("images", "frame_count")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "BOOLEAN")
+    RETURN_NAMES = ("images", "audio", "has_audio")
     FUNCTION = "splice"
     CATEGORY = CATEGORY
 
     def splice(self, vte, images, fade_frames, fade_envelope,
-               fade_color_space):
+               fade_color_space, audio=None):
         vte = core.normalize_vte(vte)
+        new_track = core.audio_from_input(audio)
+        n_new = images.shape[0]
+
         if vte["is_null"]:
-            return (images, images.shape[0])
+            # No video, so no frame rate to align to: pass audio through.
+            if new_track is not None:
+                out_audio = {"waveform": new_track[0][None],
+                             "sample_rate": new_track[1]}
+            else:
+                out_audio = core.silent_audio(n_new / core.NULL_VTE_FPS)
+            return (images, out_audio, new_track is not None)
 
         info = core.inspect_vte(vte)  # validates counts, cheap
         h, w = info["height"], info["width"]
-        n_new = images.shape[0]
 
         # Size check happens before any decoding.
         if n_new > 0 and tuple(images.shape[1:]) != (h, w, 3):
@@ -175,7 +192,15 @@ class VTESplice:
         if n_new > n_fade:
             parts.append(images[n_fade:])
         out = torch.cat(parts, dim=0)
-        return (out, out.shape[0])
+
+        fps = info["fps"] if info["fps"] > 0 else core.NULL_VTE_FPS
+        orig_track = core.decode_audio(
+            info["path"], (info["prefix"] + n_fade) / fps)
+        out_audio = core.splice_audio(
+            orig_track, new_track, info["prefix"], n_new, n_fade, fps,
+            fade_envelope)
+        has_audio = orig_track is not None or new_track is not None
+        return (out, out_audio, has_audio)
 
 
 class VTEToDict:
