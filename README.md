@@ -22,7 +22,10 @@ All nodes are under the **video_to_extend** category.
 - **Video To Extend (Null)** – no inputs; outputs a null VTE with default values.
 - **Video To Extend (Create)** – pick a video from the input folder (same list
   and upload button as VHS *Load Video (Upload)*) plus the two frame counts.
-  Always outputs a non-null VTE.
+  Always outputs a non-null VTE. A `show_preview` toggle (off by default)
+  shows or hides ComfyUI's video preview on the node. The toggle is
+  frontend-only: it's saved with the workflow but never sent to the backend,
+  so flipping it doesn't make downstream nodes re-run.
 - **Video To Extend (Read)** – outputs `is_null`, the prefix frames, the prefix
   length, the working frames, their count, and the video's `fps` (handy for a
   Video Combine node). A null VTE gives empty batches and zero counts.
