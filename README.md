@@ -44,20 +44,35 @@ All nodes are under the **video_to_extend** category.
       dissolve; physically correct, though dark areas can change unevenly.
     - `srgb` – plain mix of the stored pixel values; mid-fade frames tend to
       dip slightly darker and duller.
+  - `return_to_original` – off by default. When on, the new frames replace
+    only part of the video instead of ending it:
+    - The new batch and the working section are both cut to the shorter of
+      the two lengths, so a longer batch loses its end and a shorter batch
+      replaces only that many working frames.
+    - The new frames fade in from the original, as usual, and fade back out
+      into the original over the same `fade_frames` near their end. If the
+      two fades would overlap, both are shortened so they just meet.
+    - All original frames after that section follow, so the output has as
+      many frames as the original video (the original's frames past the
+      working section included).
 
   Audio: an optional `audio` input is the soundtrack of the input images,
   starting at their first frame. The `audio` output is spliced to match the
   video: the video file's own audio under the prefix, then the input audio
   under the new frames, crossfading from the file's old working-section audio
-  over the same `fade_frames` with the same `fade_envelope`. The input audio
+  over the same `fade_frames` with the same `fade_envelope`. With
+  `return_to_original` on, it also fades back out into the file's audio,
+  which then continues under the rest of the original frames. The input audio
   is trimmed or padded to exactly the new frames' duration. Any missing piece
   (no input audio, no audio track in the file, a track that ends early) is
   treated as silence, and if the two sources differ in sample rate or channel
   count, the input audio's sample rate and the larger channel count win.
 
   Outputs: `images`, `audio` (always a track, silent if need be), and
-  `has_audio`, which is false when neither source contributed any audio, so a
-  downstream node can choose to leave the audio track out entirely.
+  `has_audio`. `has_audio` is true when a source that has an audio track
+  (even a silent one) supplies part of the output: the video file if any of
+  its timeline is used, the `audio` input if any new frames are used. When
+  it's false, a downstream node can leave the audio track out entirely.
 
   With a null VTE the input images and audio pass through unchanged (silence,
   sized at 24 fps, if there's no input audio).

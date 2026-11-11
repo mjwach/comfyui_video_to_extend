@@ -117,7 +117,8 @@ class VTERead:
 class VTESplice:
     """Outputs the VTE's prefix followed by new frames, with an optional
     crossfade from the old working frames into the new ones, plus a matching
-    spliced audio track."""
+    spliced audio track. With return_to_original on, the new frames are also
+    faded back out into the original, which then continues to its end."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -128,12 +129,21 @@ class VTESplice:
                 "fade_frames": ("INT", {
                     "default": 0, "min": 0, "max": BIG,
                     "tooltip": "0 = no fade. Clamped silently to the frames "
-                               "available on both sides. Also used for the "
-                               "audio crossfade."}),
+                               "available. Also used for the audio "
+                               "crossfade, and for the fade back out when "
+                               "return_to_original is on."}),
                 "fade_envelope": (list(core.FADE_ENVELOPES.keys()),),
                 "fade_color_space": (list(core.FADE_COLOR_SPACES), {
                     "tooltip": "Colour space the crossfade is mixed in. oklab "
                                "usually looks smoothest."}),
+                "return_to_original": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Off: the output ends with the new frames. "
+                               "On: the new frames and the working section "
+                               "are both cut to the shorter of the two, the "
+                               "new frames fade in and back out, and the "
+                               "rest of the original video follows, so the "
+                               "output is as long as the original."}),
             },
             "optional": {
                 "audio": ("AUDIO", {
@@ -148,9 +158,12 @@ class VTESplice:
     CATEGORY = CATEGORY
 
     def splice(self, vte, images, fade_frames, fade_envelope,
-               fade_color_space, audio=None):
+               fade_color_space, return_to_original=False, audio=None):
         vte = core.normalize_vte(vte)
         new_track = core.audio_from_input(audio)
+        # A connected AUDIO counts as a track even if it's silent or empty.
+        new_has_track = (isinstance(audio, dict)
+                         and audio.get("waveform") is not None)
         n_new = images.shape[0]
 
         if vte["is_null"]:
@@ -160,7 +173,7 @@ class VTESplice:
                              "sample_rate": new_track[1]}
             else:
                 out_audio = core.silent_audio(n_new / core.NULL_VTE_FPS)
-            return (images, out_audio, new_track is not None)
+            return (images, out_audio, new_has_track)
 
         info = core.inspect_vte(vte)  # validates counts, cheap
         h, w = info["height"], info["width"]
@@ -172,34 +185,70 @@ class VTESplice:
                 f"{images.shape[2]}x{images.shape[1]} with {images.shape[3]} "
                 f"channels, but {vte['video_file']!r} is {w}x{h} RGB.")
 
-        n_fade = max(0, min(int(fade_frames), info["working"], n_new))
-        prefix, old = core.decode_sections(
-            info["path"], info["prefix"], n_fade, h, w)
-        if prefix.shape[0] < info["prefix"]:
+        prefix_n, working = info["prefix"], info["working"]
+        fade = max(0, int(fade_frames))
+        if return_to_original:
+            k = min(n_new, working)        # new frames and working set, cut
+            new = images[:k]               # to the same length
+            fade = min(fade, k // 2)       # the two fades at most meet
+            ranges = [(0, prefix_n),                       # prefix
+                      (prefix_n, prefix_n + fade),         # under fade-in
+                      (prefix_n + k - fade, prefix_n + k),  # under fade-out
+                      (prefix_n + k, None)]                # rest of video
+        else:
+            k = n_new
+            new = images
+            fade = min(fade, working, n_new)
+            ranges = [(0, prefix_n), (prefix_n, prefix_n + fade),
+                      (0, 0), (0, 0)]
+        prefix, old_in, old_out, tail = core.decode_ranges(
+            info["path"], ranges, h, w)
+        if prefix.shape[0] < prefix_n:
             raise ValueError(
                 f"VideoToExtend: {vte['video_file']!r} decoded to only "
                 f"{prefix.shape[0]} frames, fewer than the prefix "
-                f"({info['prefix']}).")
-        n_fade = min(n_fade, old.shape[0])  # graceful if decoding fell short
+                f"({prefix_n}).")
+        # Graceful if the decoder came up short of the probed frame count.
+        fade_in = min(fade, old_in.shape[0])
+        fade_out = fade if return_to_original else 0
+        if old_out.shape[0] != fade_out:
+            fade_out = 0
 
         device = images.device
         dtype = images.dtype if n_new > 0 else torch.float32
-        parts = [prefix.to(device, dtype)]
-        if n_fade > 0:
+
+        def put(t):
+            return t.to(device, dtype)
+
+        parts = [put(prefix)]
+        if fade_in > 0:
             parts.append(core.blend_frames(
-                old[:n_fade].to(device, dtype), images[:n_fade],
+                put(old_in[:fade_in]), new[:fade_in],
                 fade_color_space, fade_envelope))
-        if n_new > n_fade:
-            parts.append(images[n_fade:])
+        if k - fade_out > fade_in:
+            parts.append(new[fade_in:k - fade_out])
+        if fade_out > 0:
+            parts.append(core.blend_frames(
+                new[k - fade_out:k], put(old_out),
+                fade_color_space, fade_envelope))
+        if tail.shape[0] > 0:
+            parts.append(put(tail))
         out = torch.cat(parts, dim=0)
+        total = out.shape[0]
 
         fps = info["fps"] if info["fps"] > 0 else core.NULL_VTE_FPS
-        orig_track = core.decode_audio(
-            info["path"], (info["prefix"] + n_fade) / fps)
-        out_audio = core.splice_audio(
-            orig_track, new_track, info["prefix"], n_new, n_fade, fps,
-            fade_envelope)
-        has_audio = orig_track is not None or new_track is not None
+        file_has_track = info.get("has_audio", True)
+        orig_frames = total if return_to_original else prefix_n + fade_in
+        orig_track = (core.decode_audio(info["path"], orig_frames / fps)
+                      if file_has_track else None)
+        out_audio = core.mix_audio(
+            orig_track, new_track, prefix_n, k, total, fps,
+            fade_in, fade_out, fade_envelope)
+        # A source counts if it has a track (even a silent one) and some of
+        # the output's timeline comes from it.
+        orig_used = total > k or fade_in + fade_out > 0
+        has_audio = ((file_has_track and orig_used)
+                     or (new_has_track and k > 0))
         return (out, out_audio, has_audio)
 
 

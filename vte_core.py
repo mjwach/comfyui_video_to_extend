@@ -115,11 +115,13 @@ def probe_video(path):
         height = stream.codec_context.height
         rate = stream.average_rate or stream.guessed_rate
         fps = float(rate) if rate else 0.0
+        has_audio = len(container.streams.audio) > 0
         frames = 0
         for packet in container.demux(stream):
             if packet.size and not getattr(packet, "is_discard", False):
                 frames += 1
-    info = {"frames": frames, "width": width, "height": height, "fps": fps}
+    info = {"frames": frames, "width": width, "height": height, "fps": fps,
+            "has_audio": has_audio}
     if len(_probe_cache) >= _PROBE_CACHE_MAX:
         _probe_cache.clear()
     _probe_cache[key] = info
@@ -172,28 +174,44 @@ def _to_image_batch(arrays, height, width):
     return batch.to(torch.float32).div_(255.0)
 
 
-def decode_sections(path, n_prefix, n_work, height, width):
-    """Decode frames [0, n_prefix) and [n_prefix, n_prefix + n_work).
+def decode_ranges(path, ranges, height, width):
+    """Decode the frames in each [start, end) range in one sequential pass.
 
-    n_work=None decodes everything after the prefix. Stops reading as soon as
-    the requested frames are in hand. Returns two IMAGE batches (B, H, W, 3).
+    end=None means "to the end of the file". Reading stops as soon as every
+    range is complete, and only frames inside some range are converted.
+    Returns one IMAGE batch (B, H, W, 3) per range; ranges may overlap.
     """
-    prefix, work = [], []
-    limit = None if n_work is None else n_prefix + n_work
-    if limit != 0:
+    ranges = [(max(0, int(a)), None if b is None else int(b)) for a, b in ranges]
+    live = [(a, b) for a, b in ranges if b is None or b > a]
+    kept = [[] for _ in ranges]
+    if live:
+        limit = (None if any(b is None for _, b in live)
+                 else max(b for _, b in live))
         import av
         with av.open(path) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
-            i = 0
-            for frame in container.decode(stream):
-                arr = frame.to_ndarray(format="rgb24")
-                (prefix if i < n_prefix else work).append(arr)
-                i += 1
-                if limit is not None and i >= limit:
+            for i, frame in enumerate(container.decode(stream)):
+                arr = None
+                for k, (a, b) in enumerate(ranges):
+                    if i >= a and (b is None or i < b):
+                        if arr is None:
+                            arr = frame.to_ndarray(format="rgb24")
+                        kept[k].append(arr)
+                if limit is not None and i + 1 >= limit:
                     break
-    return (_to_image_batch(prefix, height, width),
-            _to_image_batch(work, height, width))
+    return [_to_image_batch(frames, height, width) for frames in kept]
+
+
+def decode_sections(path, n_prefix, n_work, height, width):
+    """Decode frames [0, n_prefix) and [n_prefix, n_prefix + n_work).
+
+    n_work=None decodes everything after the prefix.
+    """
+    end = None if n_work is None else n_prefix + n_work
+    prefix, work = decode_ranges(
+        path, [(0, n_prefix), (n_prefix, end)], height, width)
+    return prefix, work
 
 
 def empty_batch():
@@ -382,39 +400,54 @@ def silent_audio(seconds, sr=DEFAULT_SAMPLE_RATE, channels=DEFAULT_CHANNELS):
     return {"waveform": torch.zeros(1, channels, n), "sample_rate": sr}
 
 
-def splice_audio(orig, new, prefix_frames, new_frames, fade_frames, fps,
-                 envelope):
-    """Audio matching a video splice: the original track under the prefix,
-    then the new track under the new frames, crossfading from the original's
-    old working audio into the new track over the first `fade_frames` new
-    frames. Missing or short sections become silence; the new track is trimmed
-    or padded to exactly the new frames' duration.
+def _ramp(n, envelope):
+    """Rising fade weights for n samples, never exactly 0 or 1 (no clicks)."""
+    t = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+    return FADE_ENVELOPES[envelope](t)
+
+
+def mix_audio(orig, new, start_frame, new_frames, total_frames, fps,
+              fade_in_frames, fade_out_frames, envelope):
+    """Audio for a splice, laid out on the output video's timeline.
+
+    The output keeps the original video's timing outside the new section, so
+    the original track plays at its own timestamps. The new track plays under
+    the new section [start_frame, start_frame + new_frames), from its own
+    beginning, trimmed or padded to fit. Inside that section it crossfades in
+    from the original over the first fade_in_frames and back out to the
+    original over the last fade_out_frames, using the video's envelope.
+    Missing or short audio is silence. Output length matches total_frames.
     """
     sr = new[1] if new else (orig[1] if orig else DEFAULT_SAMPLE_RATE)
     channels = max([t[0].shape[0] for t in (orig, new) if t]
                    or [DEFAULT_CHANNELS])
     o, n = _conform(orig, sr, channels), _conform(new, sr, channels)
 
-    s_pre = round(prefix_frames * sr / fps)
-    s_total = max(1, round((prefix_frames + new_frames) * sr / fps))
-    s_new = max(0, s_total - s_pre)
-    s_fade = min(s_new, round((prefix_frames + fade_frames) * sr / fps) - s_pre)
+    def at(frame):
+        return round(frame * sr / fps)
 
+    s_total = max(1, at(total_frames))
     out = torch.zeros(channels, s_total)
     if o is not None:
-        k = min(o.shape[1], s_pre)
+        k = min(o.shape[1], s_total)
         out[:, :k] = o[:, :k]
-    if n is not None:
-        k = min(n.shape[1], s_new)
-        out[:, s_pre:s_pre + k] = n[:, :k]
-    if s_fade > 0:
-        old = torch.zeros(channels, s_fade)
-        if o is not None:
-            seg = o[:, s_pre:s_pre + s_fade]
-            old[:, :seg.shape[1]] = seg
-        # Smooth ramp across the whole region, so there's no click at its ends.
-        t = (torch.arange(s_fade, dtype=torch.float32) + 0.5) / s_fade
-        e = FADE_ENVELOPES[envelope](t)
-        region = out[:, s_pre:s_pre + s_fade]
-        out[:, s_pre:s_pre + s_fade] = old * (1 - e) + region * e
+
+    s0 = min(at(start_frame), s_total)
+    s1 = min(at(start_frame + new_frames), s_total)
+    if s1 > s0:
+        length = s1 - s0
+        region = torch.zeros(channels, length)
+        if n is not None:
+            k = min(n.shape[1], length)
+            region[:, :k] = n[:, :k]
+        weight = torch.ones(length)
+        f_in = min(at(start_frame + fade_in_frames) - s0, length)
+        f_out = min(s1 - at(start_frame + new_frames - fade_out_frames), length)
+        if f_in > 0:
+            weight[:f_in] = _ramp(f_in, envelope)
+        if f_out > 0:
+            weight[length - f_out:] = torch.minimum(
+                weight[length - f_out:], 1.0 - _ramp(f_out, envelope))
+        old = out[:, s0:s1].clone()
+        out[:, s0:s1] = old * (1.0 - weight) + region * weight
     return {"waveform": out[None], "sample_rate": sr}
